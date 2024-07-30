@@ -1,0 +1,182 @@
+# Import statements
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.functions import lit, col, udf, when
+from pyspark.sql.types import StringType
+from functools import reduce
+import logging
+import os
+import findspark
+
+# Initialize Spark
+findspark.init()
+spark = (
+    SparkSession
+    .builder
+    .appName("cg-pyspark-assignment")
+    .master("local")
+    .config("spark.sql.repl.eagerEval.enabled", True)
+    .getOrCreate()
+)
+
+# Initialize logger
+LOGGER = logging.getLogger()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def get_data_by_brand(brand: str, logger: logging.Logger = LOGGER) -> DataFrame:
+    """Fetch input data based on brand.
+
+    Args:
+        brand: allowed values are (clp, okay, spar, dats, cogo)
+        logger: Logger object for logging
+
+    Returns:
+        The relevant DataFrame
+    """
+    logger.info(f"Loading data for brand: {brand}")
+    
+    if brand not in ['clp', 'okay', 'spar', 'dats', 'cogo']:
+        logger.error(f"Invalid brand value: {brand}")
+        raise ValueError("Invalid brand value. Allowed values are: clp, okay, spar, dats, cogo")
+    
+    file_path = f"/content/{brand}-places.json"
+    
+    if not os.path.exists(file_path):
+        logger.error(f"File path does not exist: {file_path}")
+        raise FileNotFoundError(f"File path does not exist: {file_path}")
+    
+    try:
+        df = spark.read.json(file_path)
+        logger.info(f"Data loaded successfully for brand: {brand}")
+    except Exception as e:
+        logger.error(f"Error loading data for brand: {brand}: {str(e)}")
+        raise
+    
+    # Add brand column
+    df = df.withColumn("brand", lit(brand))
+    return df
+
+def union_all(dfs: list) -> DataFrame:
+    """Combine multiple DataFrames into a single DataFrame using unionByName."""
+    return reduce(lambda df1, df2: df1.unionByName(df2), dfs)
+
+def add_missing_columns(df: DataFrame, required_cols: list) -> DataFrame:
+    """Add missing columns to DataFrame with default values."""
+    for col_name in required_cols:
+        if col_name not in df.columns:
+            df = df.withColumn(col_name, lit(None))
+    return df
+
+def handle_dataframes(dataframes: dict, required_cols: list) -> dict:
+    """Ensure all DataFrames have the required columns."""
+    for name, df in dataframes.items():
+        dataframes[name] = add_missing_columns(df, required_cols)
+    return dataframes
+
+def preprocess_data(df: DataFrame) -> DataFrame:
+    """Process DataFrame according to the given requirements.
+
+    Args:
+        df: The input DataFrame.
+
+    Returns:
+        The processed DataFrame.
+    """
+    # Drop 'placeSearchOpeningHours'
+    if "placeSearchOpeningHours" in df.columns:
+        df = df.drop("placeSearchOpeningHours")
+
+    # Transform 'geoCoordinates' into 'lat' and 'lon'
+    if "geoCoordinates" in df.columns:
+        df = df.withColumn("lat", col("geoCoordinates.latitude"))
+        df = df.withColumn("lon", col("geoCoordinates.longitude"))
+
+    # Extract 'postal_code' from 'address'
+    postal_code_udf = udf(lambda address: address.split()[-1] if address else None, StringType())
+    df = df.withColumn("postal_code", postal_code_udf(col("address")))
+
+    # Create 'province' column based on 'postal_code'
+    df = df.withColumn("province", when(col("postal_code").between("1000", "1299"), "Brussel")
+                                    .when(col("postal_code").between("1300", "1499"), "Waals-Brabant")
+                                    .when(col("postal_code").between("1500", "1999"), "Vlaams-Brabant")
+                                    .when(col("postal_code").between("2000", "2999"), "Antwerpen")
+                                    .when(col("postal_code").between("3000", "3499"), "Vlaams-Brabant")
+                                    .when(col("postal_code").between("3500", "3999"), "Limburg")
+                                    .when(col("postal_code").between("4000", "4999"), "Luik")
+                                    .when(col("postal_code").between("5000", "5999"), "Namen")
+                                    .when(col("postal_code").between("6000", "6599"), "Henegouwen")
+                                    .when(col("postal_code").between("7000", "7999"), "Henegouwen")
+                                    .when(col("postal_code").between("6600", "6999"), "Luxemburg")
+                                    .when(col("postal_code").between("8000", "8999"), "West-Vlaanderen")
+                                    .when(col("postal_code").between("9000", "9999"), "Oost-Vlaanderen")
+                                    .otherwise("Unknown"))
+
+    # One-hot encode 'handoverServices'
+    if "handoverServices" in df.columns:
+        df = df.withColumn("handoverServices", col("handoverServices").cast("string"))
+        df = df.withColumn("handoverServices", when(col("handoverServices").isNull(), lit("None"))
+                                        .otherwise(col("handoverServices")))
+
+    # Handle GDPR sensitive data
+    df = df.withColumn("houseNumber", lit("ANONYMIZED"))
+    df = df.withColumn("streetName", lit("ANONYMIZED"))
+
+    return df
+
+def save_data(df: DataFrame, path: str) -> None:
+    """Save DataFrame to parquet file with partitioning.
+
+    Args:
+        df: The DataFrame to save.
+        path: The path where the parquet file will be saved.
+    """
+    df.write.partitionBy("postal_code").mode("overwrite").parquet(path)
+    LOGGER.info(f"Data saved successfully to: {path}")
+
+# Initialize variables
+combined_df = None
+processed_df = None
+
+# List of DataFrames and their respective names
+dataframes = {
+    'clp': None,
+    'okay': None,
+    'spar': None,
+    'dats': None,
+    'cogo': None
+}
+
+# Define the required columns
+required_columns = ['handoverServices']
+
+# Fetch DataFrames
+try:
+    for name in dataframes.keys():
+        dataframes[name] = get_data_by_brand(name)
+
+    # Ensure all DataFrames have the required columns
+    dataframes = handle_dataframes(dataframes, required_columns)
+
+    # Combine DataFrames
+    combined_df = union_all(list(dataframes.values()))
+
+    # Preprocess Data
+    processed_df = preprocess_data(combined_df)
+
+    # Save Data
+    save_data(processed_df, "/content/combined_places.parquet")
+
+except Exception as e:
+    LOGGER.error(f"Failed to process data: {str(e)}")
+
+# Show sample data for each DataFrame if they were successfully loaded
+for name, df in dataframes.items():
+    if df is not None:
+        df.show(5)
+
+# Show the combined DataFrame if it was successfully created
+if combined_df is not None:
+    combined_df.show(5)
+
+# Show the processed DataFrame if it was successfully processed
+if processed_df is not None:
+    processed_df.show(5)
